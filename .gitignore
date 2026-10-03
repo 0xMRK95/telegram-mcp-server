@@ -1,0 +1,37 @@
+# --- SECRETS: NEVER COMMIT ---
+# Telegram session files contain the auth key. Anyone with the file
+# can log in as you. This is the single most important line here.
+*.session
+*.session-journal
+
+# Credentials / env
+.env
+.env.*
+!.env.example
+*.env
+*.env.*
+!.env.example
+config.py
+config.local.py
+secrets.json
+credentials.json
+
+# Scan output can contain private chat content and personal identifiers
+scan_results.json
+scan_batch_*.json
+channels_list.json
+*_report.md
+chat_classification_*.md
+leave_batches.json
+downloads/
+*.mp4 *.jpg *.jpeg *.png *.ogg *.webm
+
+# Tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.venv/
+venv/
