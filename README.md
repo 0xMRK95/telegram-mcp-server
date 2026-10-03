@@ -11,6 +11,14 @@ A local **stdio** MCP server for Telegram user accounts, using Telethon. Support
 - Tools act as the selected account. This server does not implement a user-approval layer: configure your MCP client to require confirmation for sending, joining, leaving, blocking, folder changes, and other writes. Use it only for accounts you own or are authorized to manage.
 - The protocol is local stdio only. Do not expose this process as an unauthenticated network service.
 
+## Default organization-only policy
+
+The server defaults to `TG_MODE=organization`. Only read/list/discovery tools and **creation of new folders** are exposed and callable. Direct forged tool calls are checked before any account connection. Sending, joining, leaving, blocking, deleting, updating existing folders, archiving, reactions, button clicks, and media downloads are blocked. Read scans may save output locally; they do not change Telegram messages or read state.
+
+New folders must contain the selected chats at creation time. This mode does not modify existing folders, including ones created in a previous call. Existing IDs are refused and checked again immediately before submission. Telegram has no atomic create-if-absent API, so avoid editing folders from another device during creation; an external concurrent edit cannot be guaranteed safe. Folder titles are limited to 12 characters by Telegram; choose an approved short title when a requested name is longer.
+
+For a separately authorized general-purpose deployment, explicitly set `TG_MODE=general` in the launcher to expose other tools. This is an opt-in to tool availability, not permission to perform arbitrary actions. Mini App URL retrieval stays disabled in both modes.
+
 ## Install
 
 Requires Python 3.10 or newer. Create a dedicated environment, then install the dependencies:
@@ -30,7 +38,7 @@ python onboarding.py personal
 python onboarding.py work
 ```
 
-Each run requests API ID, API hash, phone, login code, and (if needed) two-step password using hidden terminal input. It shows the Telegram user ID/username and asks you to confirm the alias pairing. No credential values are printed. Hidden input fails closed if no private interactive terminal is available.
+Run this in a trusted interactive terminal on your chosen runtime, which may be a cloud host. If TG_API_ID and TG_API_HASH are already securely injected as environment variables (for example by a private vault), enrollment reuses them without echoing or prompting. Otherwise it requests those credentials using hidden input. Phone, login code, and any two-step password are also entered with hidden terminal input. A vault containing only API ID/hash is not an authenticated Telegram session; a supported private interactive login channel is still required. It shows the Telegram user ID/username and asks you to confirm the alias pairing. No credential values are printed. Hidden input fails closed if no private interactive terminal is available.
 
 Defaults:
 
@@ -52,7 +60,8 @@ Only the configuration **path**, not its contents, belongs in your launcher:
       "command": "/absolute/path/to/.venv/bin/python",
       "args": ["/absolute/path/to/telegram_mcp_server.py"],
       "env": {
-        "TG_ACCOUNTS_FILE": "/home/you/.config/telegram-mcp/accounts.json"
+        "TG_ACCOUNTS_FILE": "/home/you/.config/telegram-mcp/accounts.json",
+        "TG_MODE": "organization"
       }
     }
   }
@@ -86,6 +95,8 @@ Existing `TG_API_ID`, `TG_API_HASH`, and `TG_SESSION_NAME` environment configura
 Legacy mode requires an existing private session, and does not have a configured identity binding. New setups should use onboarding and named configuration. Do not copy sessions through chat.
 
 ## Tools
+
+The full catalog below describes general mode; organization mode exposes only the restricted subset above.
 
 ### Organization
 

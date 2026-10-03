@@ -158,6 +158,13 @@ class AccountTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(AccountError):
             await self.manager.get_client('work')
 
+    async def test_api_credentials_reuse_environment_without_prompt_or_output(self):
+        with patch.dict(os.environ, {'TG_API_ID': '42', 'TG_API_HASH': 'fake-vault-hash'}), \
+             patch.object(onboarding, 'secret') as prompt, contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(onboarding.api_credentials(), (42, 'fake-vault-hash'))
+            prompt.assert_not_called()
+            self.assertEqual(output.getvalue(), '')
+
     async def test_password_whitespace_preserved(self):
         with patch.object(sys.stdin, 'isatty', return_value=True), patch.object(sys.stderr, 'isatty', return_value=True), \
              patch.object(getpass, 'getpass', return_value='  password  '):

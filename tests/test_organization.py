@@ -79,6 +79,35 @@ def make_folder(**kwargs):
 
 
 class OrganizationTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.mode_patch = patch.object(server, 'MODE', 'general')
+        self.mode_patch.start()
+        self.addCleanup(self.mode_patch.stop)
+
+    async def test_organization_policy_blocks_forged_writes_before_network(self):
+        blocked = ('send_message', 'send_location', 'forward_messages', 'pin_message',
+                   'add_reaction', 'join_chat', 'leave_chat', 'leave_channels', 'block_chats',
+                   'click_button', 'request_web_app', 'update_folder', 'archive_chats',
+                   'unarchive_chats', 'download_media', 'unknown_tool')
+        with patch.object(server, 'MODE', 'organization'), patch.object(server, 'get_client', AsyncMock()) as get_client:
+            tools = await server.list_tools()
+            self.assertEqual({t.name for t in tools}, server.ORGANIZATION_TOOLS)
+            for name in blocked:
+                result = json.loads((await server.call_tool(name, {'account': 'default', 'folder_id': 2}))[0].text)
+                self.assertIn('blocked', result['error'])
+            get_client.assert_not_called()
+
+    async def test_create_rechecks_occupied_id_without_write(self):
+        client = Client()
+        responses = iter([[], [make_folder(id=3)]])
+        async def changed_filters(request):
+            if type(request).__name__ == 'GetDialogFiltersRequest':
+                return next(responses)
+            raise AssertionError('Must not mutate an occupied ID')
+        with patch.object(Client, '__call__', side_effect=changed_filters):
+            with self.assertRaises(ValueError):
+                await folders.manage_folders(client, 'create_folder', {'folder_id': 3, 'title': 'Work', 'chats': ['12']})
+
     async def test_list_and_create(self):
         client = Client([make_folder()])
         result = await folders.manage_folders(client, 'list_folders', {})

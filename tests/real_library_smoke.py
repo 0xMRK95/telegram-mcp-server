@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-os.environ.update(TG_API_ID='1', TG_API_HASH='offline-test', TG_SESSION_NAME='/nonexistent/offline')
+os.environ.update(TG_MODE='general', TG_API_ID='1', TG_API_HASH='offline-test', TG_SESSION_NAME='/nonexistent/offline')
 os.environ.pop('TG_ACCOUNTS_FILE', None)
 from telethon import TelegramClient, utils
 from telethon.tl import types

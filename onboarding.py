@@ -31,6 +31,17 @@ def secret(prompt, *, preserve_whitespace=False):
     return value if preserve_whitespace else value.strip()
 
 
+def api_credentials():
+    """Reuse securely injected vault/environment values without echoing them."""
+    api_id_text = os.environ.get('TG_API_ID') or secret('Telegram API ID (hidden): ')
+    api_hash = os.environ.get('TG_API_HASH') or secret('Telegram API hash (hidden): ')
+    if not api_id_text.isdecimal() or int(api_id_text) <= 0:
+        raise AccountError('API ID must be a positive integer')
+    if not api_hash.strip():
+        raise AccountError('API hash must not be blank')
+    return int(api_id_text), api_hash
+
+
 def read_config(path):
     if not path.exists():
         return {'accounts': {}}
@@ -80,16 +91,13 @@ async def enroll(alias, config, sessions):
         session = sessions / (alias + '.session')
         if session.exists():
             raise AccountError('Session path already exists; choose a fresh alias or inspect the old session yourself')
-        api_id_text = secret('Telegram API ID (hidden): ')
-        if not api_id_text.isdecimal() or int(api_id_text) <= 0:
-            raise AccountError('API ID must be a positive integer')
-        api_hash = secret('Telegram API hash (hidden): ')
+        api_id, api_hash = api_credentials()
         phone = secret('Phone number with country code (hidden): ')
         session_lock = SessionLock(session)
         session_lock.acquire()
         from telethon import TelegramClient
         from telethon.errors import SessionPasswordNeededError
-        client = TelegramClient(str(session), int(api_id_text), api_hash)
+        client = TelegramClient(str(session), api_id, api_hash)
         await client.connect()
         sent = await client.send_code_request(phone)
         code = secret('Telegram login code (hidden): ')
@@ -104,7 +112,7 @@ async def enroll(alias, config, sessions):
         if input('Save this account pairing? Type yes: ').strip() != 'yes':
             raise AccountError('Account pairing was not saved')
         private_file(session)
-        data['accounts'][alias] = {'api_id': int(api_id_text), 'api_hash': api_hash,
+        data['accounts'][alias] = {'api_id': api_id, 'api_hash': api_hash,
                                    'session': str(session), 'expected_user_id': me.id}
         write_config(config, data)
         confirmed = True

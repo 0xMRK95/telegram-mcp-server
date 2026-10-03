@@ -100,6 +100,11 @@ async def manage_folders(client, name, arguments):
             folder.pinned_peers = [p for p in folder.pinned_peers if utils.get_peer_id(p) not in removals]
         else:
             raise ValueError('Unknown folder operation')
+        if name == 'create_folder':
+            # Telegram has no create-if-absent operation. Recheck for newly occupied IDs;
+            # external clients must not edit folders concurrently with this operation.
+            if any(getattr(f, 'id', 0) == folder_id for f in await _filters(client)):
+                raise ValueError('folder_id became occupied; no update was sent')
         result = await client(UpdateDialogFilterRequest(id=folder_id, filter=folder))
         if not result:
             raise RuntimeError('Telegram did not confirm the folder update')

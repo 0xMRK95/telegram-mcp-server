@@ -25,6 +25,15 @@ load_dotenv(Path(__file__).resolve().with_name(".env"), override=False)
 
 from telegram_accounts import AccountManager, AccountError
 accounts = AccountManager.from_environment()
+MODE = os.environ.get("TG_MODE", "organization")
+if MODE not in ("organization", "general"):
+    raise AccountError("TG_MODE must be organization or general")
+ORGANIZATION_TOOLS = frozenset({
+    "list_accounts", "list_chats", "chat_info", "read_messages", "get_mentions",
+    "search_messages", "get_members", "profile", "extract_refs", "search_public",
+    "get_recommendations", "scan_channels_content", "list_folders", "create_folder",
+})
+
 
 async def get_client(alias=None):
     return await accounts.get_client(alias)
@@ -380,10 +389,12 @@ async def list_tools() -> list[types.Tool]:
             tool.inputSchema.setdefault("required", []).append("account")
     tools.insert(0, types.Tool(name="list_accounts", description="List configured aliases only; no Telegram connection or secrets.",
                               inputSchema={"type": "object", "properties": {}}))
-    return tools
+    return [tool for tool in tools if MODE == "general" or tool.name in ORGANIZATION_TOOLS]
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextContent]:
+    if MODE == "organization" and name not in ORGANIZATION_TOOLS:
+        return [types.TextContent(type="text", text=json.dumps({"error": "Tool blocked by organization-only policy; no account action was attempted"}))]
     if name == "list_accounts":
         return [types.TextContent(type="text", text=json.dumps({"accounts": list(accounts.accounts)}))]
     if name == "request_web_app":
