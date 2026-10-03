@@ -7,6 +7,10 @@ import os
 import re
 import sys
 from typing import Any
+from pathlib import Path
+from dotenv import load_dotenv
+from telegram_folders import manage_folders, set_archived, organization_tools
+from telethon import utils
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -14,37 +18,30 @@ from mcp import types
 
 from telethon import TelegramClient
 from telethon.tl.types import ChannelForbidden, ChatForbidden, Channel, Chat, User
-from telethon.tl.functions.messages import GetBotCallbackAnswerRequest, RequestAppWebViewRequest
-from telethon.tl.types import KeyboardButtonCallback, KeyboardButtonUrl, KeyboardButtonSwitchInline, InputMediaGeoPoint, GeoPoint, InputBotAppShortName, InputUser
+from telethon.tl.functions.messages import GetBotCallbackAnswerRequest
+from telethon.tl import types as tl_types
 
-def _required_env(name: str) -> str:
-    """Read a required environment variable or exit with an actionable message."""
-    value = os.environ.get(name)
-    if not value:
-        sys.exit(
-            f"[telegram-mcp] Missing required environment variable: {name}\n"
-            f"[telegram-mcp] Copy .env.example to .env, fill it in, and export the values."
-        )
-    return value
+load_dotenv(Path(__file__).resolve().with_name(".env"), override=False)
+
+from telegram_accounts import AccountManager, AccountError
+accounts = AccountManager.from_environment()
+MODE = os.environ.get("TG_MODE", "organization")
+if MODE not in ("organization", "general"):
+    raise AccountError("TG_MODE must be organization or general")
+ORGANIZATION_TOOLS = frozenset({
+    "list_accounts", "list_chats", "chat_info", "read_messages", "get_mentions",
+    "search_messages", "get_members", "profile", "extract_refs", "search_public",
+    "get_recommendations", "scan_channels_content", "list_folders", "create_folder",
+})
 
 
-API_ID = int(_required_env("TG_API_ID"))
-API_HASH = _required_env("TG_API_HASH")
-# Session file NAME (no .session suffix). The auth key lives in the resulting
-# .session SQLite database - that file must never be committed or shared.
-SESSION_NAME = _required_env("TG_SESSION_NAME")
+async def get_client(alias=None):
+    return await accounts.get_client(alias)
 
-# Singleton client
-_client: TelegramClient | None = None
 
-async def get_client() -> TelegramClient:
-    global _client
-    if _client is None or not _client.is_connected():
-        _client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
-        await _client.connect()
-        if not await _client.is_user_authorized():
-            return None
-    return _client
+def safe_error(error):
+    # Telethon exception messages may include phone numbers, request data, or URLs.
+    return str(error) if isinstance(error, AccountError) else type(error).__name__
 
 async def _resolve(client: TelegramClient, target: str):
     target = target.strip()
@@ -56,6 +53,18 @@ async def _resolve(client: TelegramClient, target: str):
         return await client.get_entity(target)
     except Exception:
         return await client.get_entity('@' + target)
+
+
+def callback_data(button):
+    """Support pre/post layer keyboard types, rejecting URL and password callbacks."""
+    legacy = getattr(tl_types, "KeyboardButtonCallback", None)
+    modern = getattr(tl_types, "InlineButtonTypeCallback", None)
+    payload = button if legacy and isinstance(button, legacy) else getattr(button, "type", None)
+    if payload is None or not ((legacy and isinstance(payload, legacy)) or (modern and isinstance(payload, modern))):
+        return None
+    if getattr(payload, "requires_password", False):
+        return None
+    return payload.data
 
 
 def _message_mentions_account(message: Any, account_id: int, username: str | None) -> bool:
@@ -99,7 +108,7 @@ server = Server("telegram")
 
 @server.list_tools()
 async def list_tools() -> list[types.Tool]:
-    return [
+    tools = organization_tools(types.Tool) + [
         types.Tool(
             name="list_chats",
             description="List all Telegram chats (channels, groups, bots, users). Filter by type: channels, groups, bots, users, or all.",
@@ -362,36 +371,56 @@ async def list_tools() -> list[types.Tool]:
                 "properties": {
                     "chat": {"type": "string", "description": "Chat username or ID"},
                     "message_id": {"type": "integer", "description": "Message ID containing the inline button"},
-                    "button_text": {"type": "string", "description": "Text of the button to click (fuzzy match). Alternative to row/col."},
+                    "button_text": {"type": "string", "description": "Exact text of the callback button to click. Alternative to row/col."},
                     "row": {"type": "integer", "description": "Row index (0-based) of the button"},
                     "col": {"type": "integer", "description": "Column index (0-based) of the button"},
                 },
                 "required": ["chat", "message_id"],
             },
         ),
-        types.Tool(
-            name="request_web_app",
-            description="Request a bot's Web App/Minor App URL. Provide bot username. Returns the full web app URL if found.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "bot": {"type": "string", "description": "Bot username (with or without @)"},
-                    "short_name": {"type": "string", "description": "App short name (default: app) — try: app, webapp, main, web"},
-                    "platform": {"type": "string", "description": "Platform: android, ios, web (default: android)"},
-                },
-                "required": ["bot"],
-            },
-        ),
+
     ]
+
+    for tool in tools:
+        tool.inputSchema.setdefault("properties", {})["account"] = {
+            "type": "string", "enum": list(accounts.accounts),
+            "description": "Exact account alias; never falls back to another account"}
+        if accounts.require_alias or len(accounts.accounts) > 1:
+            tool.inputSchema.setdefault("required", []).append("account")
+    tools.insert(0, types.Tool(name="list_accounts", description="List configured aliases only; no Telegram connection or secrets.",
+                              inputSchema={"type": "object", "properties": {}}))
+    return [tool for tool in tools if MODE == "general" or tool.name in ORGANIZATION_TOOLS]
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextContent]:
-    client = await get_client()
-    if client is None:
-        return [types.TextContent(type="text", text=json.dumps({"error": "Not authenticated. Re-login required."}))]
-
+    if MODE == "organization" and name not in ORGANIZATION_TOOLS:
+        return [types.TextContent(type="text", text=json.dumps({"error": "Tool blocked by organization-only policy; no account action was attempted"}))]
+    if name == "list_accounts":
+        return [types.TextContent(type="text", text=json.dumps({"accounts": list(accounts.accounts)}))]
+    if name == "request_web_app":
+        return [types.TextContent(type="text", text=json.dumps({"error": "Mini App URLs contain authentication data; this tool is disabled"}))]
     try:
-        if name == "list_chats":
+        account = accounts.select(arguments.get("account"))
+        client = await get_client(account.alias)
+        results = await _call_account_tool(name, arguments, client, str(account.output_dir))
+        for result in results:
+            payload = json.loads(result.text)
+            payload["account"] = account.alias
+            result.text = json.dumps(payload, ensure_ascii=False)
+        return results
+    except Exception as error:
+        return [types.TextContent(type="text", text=json.dumps({"error": safe_error(error)}))]
+
+
+async def _call_account_tool(name, arguments, client, output_dir):
+    try:
+        if name in ("list_folders", "create_folder", "update_folder"):
+            result = await manage_folders(client, name, arguments)
+            return [types.TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
+        elif name in ("archive_chats", "unarchive_chats"):
+            result = await set_archived(client, arguments.get("chats"), name == "archive_chats")
+            return [types.TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
+        elif name == "list_chats":
             filter_type = arguments.get("filter", "all")
             channels, groups, bots, users = [], [], [], []
             async for dialog in client.iter_dialogs():
@@ -409,11 +438,20 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
                         info["type"] = "group"
                         info["role"] = "creator" if getattr(entity, 'creator', False) else ("admin" if entity.admin_rights else "member")
                         groups.append(info)
+                elif isinstance(entity, Chat):
+                    groups.append({"id": entity.id, "title": entity.title, "username": "",
+                                   "members": getattr(entity, 'participants_count', 0), "type": "group"})
                 elif isinstance(entity, User):
                     if entity.bot:
                         bots.append({"id": entity.id, "name": getattr(entity, 'first_name', ''), "username": getattr(entity, 'username', '') or '', "type": "bot"})
                     else:
                         users.append({"id": entity.id, "name": getattr(entity, 'first_name', '') or '', "username": getattr(entity, 'username', '') or '', "type": "user"})
+                bucket = (channels if isinstance(entity, Channel) and entity.broadcast else
+                          groups if isinstance(entity, (Channel, Chat)) else
+                          bots if isinstance(entity, User) and entity.bot else users)
+                if bucket and bucket[-1]["id"] == entity.id:
+                    bucket[-1]["chat_id"] = utils.get_peer_id(entity)
+                    bucket[-1]["archived"] = bool(getattr(dialog, "archived", False))
             result = {}
             if filter_type in ("channels", "all"): result["channels"] = channels
             if filter_type in ("groups", "all"): result["groups"] = groups
@@ -487,8 +525,10 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
             latitude = float(arguments["latitude"])
             longitude = float(arguments["longitude"])
             entity = await _resolve(client, target)
-            from telethon.tl.types import InputMediaGeoPoint, GeoPoint as TGeoPoint
-            geo_point = InputMediaGeoPoint(geo_point=TGeoPoint(lat=latitude, long=longitude, access_hash=0))
+            from telethon.tl.types import InputMediaGeoPoint, InputGeoPoint
+            if not -90 <= latitude <= 90 or not -180 <= longitude <= 180:
+                raise ValueError("Invalid coordinates")
+            geo_point = InputMediaGeoPoint(geo_point=InputGeoPoint(lat=latitude, long=longitude))
             result = await client.send_message(entity, file=geo_point)
             return [types.TextContent(type="text", text=json.dumps({"success": True, "message_id": result.id, "chat": target, "lat": latitude, "lon": longitude}, ensure_ascii=False))]
 
@@ -507,25 +547,19 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
             return [types.TextContent(type="text", text=json.dumps({"chat": target, "query": query, "count": len(messages), "messages": messages}, ensure_ascii=False, indent=2))]
 
         elif name == "join_chat":
-            from telethon.tl import functions as tl_functions
+            from telethon.tl.functions.channels import JoinChannelRequest
+            from telethon.tl.functions.messages import ImportChatInviteRequest
             target = arguments["target"].strip()
-            if target.startswith('@'):
-                target = target[1:]
-            try:
+            invite = re.fullmatch(r"(?:https?://)?t\.me/(?:\+|joinchat/)([A-Za-z0-9_-]+)", target)
+            if invite:
+                result = await client(ImportChatInviteRequest(hash=invite.group(1)))
+                joined = getattr(result, "chats", [])
+                info = {"success": True, "type": "joined_invite", "ids": [c.id for c in joined]}
+            else:
                 entity = await _resolve(client, target)
-                from telethon.tl.functions.channels import JoinChannelRequest
-                result = await client(JoinChannelRequest(entity))
-                title = ""
-                for update in getattr(result, 'updates', []):
-                    if hasattr(update, 'message') and hasattr(update.message, 'chat'):
-                        title = getattr(update.message.chat, 'title', '')
-                return [types.TextContent(type="text", text=json.dumps({"success": True, "title": title, "id": entity.id, "type": "joined_channel"}, ensure_ascii=False))]
-            except Exception as e:
-                try:
-                    result = await client(functions.channels.JoinChannelRequest(target))
-                    return [types.TextContent(type="text", text=json.dumps({"success": True, "id": 0, "type": "joined_channel"}, ensure_ascii=False))]
-                except:
-                    return [types.TextContent(type="text", text=json.dumps({"error": str(e)}, ensure_ascii=False))]
+                await client(JoinChannelRequest(entity))
+                info = {"success": True, "title": getattr(entity, "title", ""), "id": entity.id, "type": "joined_channel"}
+            return [types.TextContent(type="text", text=json.dumps(info, ensure_ascii=False))]
 
         elif name == "leave_chat":
             target = arguments["target"]
@@ -546,7 +580,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
             target = arguments["chat"]
             msg_id = arguments["message_id"]
             output_dir = arguments.get("output_dir") or os.path.join(
-                os.path.dirname(SESSION_NAME) or ".", "downloads"
+                output_dir, "downloads"
             )
             os.makedirs(output_dir, exist_ok=True)
             entity = await _resolve(client, target)
@@ -572,7 +606,9 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
             msg_id = arguments["message_id"]
             emoji = arguments["emoji"]
             entity = await _resolve(client, target)
-            await client.send_reaction(entity, msg_id, emoji)
+            from telethon.tl.functions.messages import SendReactionRequest
+            from telethon.tl.types import ReactionEmoji
+            await client(SendReactionRequest(peer=entity, msg_id=msg_id, reaction=[ReactionEmoji(emoticon=emoji)]))
             return [types.TextContent(type="text", text=json.dumps({"success": True, "reaction": emoji}, ensure_ascii=False))]
 
         elif name == "forward_messages":
@@ -596,7 +632,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
             filter_type = arguments.get("filter", "channels")
             offset = arguments.get("offset", 0)
             timeout_seconds = arguments.get("timeout_seconds", 55)
-            default_save = os.path.join(os.path.dirname(SESSION_NAME) or ".", "scan_results.json")
+            default_save = os.path.join(output_dir, "scan_results.json")
             save_to = arguments.get("save_to") or default_save
             max_text_length = arguments.get("max_text_length", 200)
             import time
@@ -617,6 +653,9 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
                     if filter_type == "channels" and not is_channel:
                         continue
                     if filter_type == "groups" and not is_group:
+                        continue
+                elif isinstance(entity, Chat):
+                    if filter_type not in ("groups", "all"):
                         continue
                 elif isinstance(entity, User):
                     if filter_type != "all":
@@ -645,7 +684,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
                         "id": entity.id,
                         "title": getattr(entity, 'title', '') or getattr(entity, 'first_name', ''),
                         "username": getattr(entity, 'username', '') or '',
-                        "type": "channel" if (isinstance(entity, Channel) and entity.broadcast) else ("group" if isinstance(entity, Channel) else "user"),
+                        "type": "channel" if (isinstance(entity, Channel) and entity.broadcast) else ("group" if isinstance(entity, (Channel, Chat)) else "user"),
                         "members": getattr(entity, 'participants_count', 0) or 0,
                         "messages": msg_texts,
                     })
@@ -658,7 +697,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
                         "type": "error",
                         "members": 0,
                         "messages": [],
-                        "error": str(e),
+                        "error": safe_error(e),
                     })
                     scanned += 1
             # Save full results to file
@@ -705,7 +744,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
                     title = getattr(entity, 'title', '') or getattr(entity, 'first_name', '')
                     left.append({"id": target, "title": title})
                 except Exception as e:
-                    failed.append({"id": target, "error": str(e)})
+                    failed.append({"id": target, "error": safe_error(e)})
             return [types.TextContent(type="text", text=json.dumps({"left": left, "failed": failed, "left_count": len(left), "failed_count": len(failed)}, ensure_ascii=False))]
 
         elif name == "block_chats":
@@ -737,7 +776,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
                     title = getattr(entity, 'first_name', '') or getattr(entity, 'title', '')
                     blocked.append({"id": target, "title": title})
                 except Exception as e:
-                    failed.append({"id": target, "error": str(e)})
+                    failed.append({"id": target, "error": safe_error(e)})
             return [types.TextContent(type="text", text=json.dumps({"blocked": blocked, "failed": failed, "blocked_count": len(blocked), "failed_count": len(failed)}, ensure_ascii=False))]
 
         elif name == "search_public":
@@ -871,59 +910,30 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
                             break
                     if button:
                         break
-                # Fuzzy match if no exact match
-                if not button:
-                    for row in msg.reply_markup.rows:
-                        for btn in row.buttons:
-                            if button_text in btn.text:
-                                button = btn
-                                break
-                        if button:
-                            break
             elif row_idx is not None and col_idx is not None:
                 # Index-based selection
-                if row_idx < len(msg.reply_markup.rows) and col_idx < len(msg.reply_markup.rows[row_idx].buttons):
+                if 0 <= row_idx < len(msg.reply_markup.rows) and 0 <= col_idx < len(msg.reply_markup.rows[row_idx].buttons):
                     button = msg.reply_markup.rows[row_idx].buttons[col_idx]
             elif row_idx is not None:
-                if row_idx < len(msg.reply_markup.rows) and len(msg.reply_markup.rows[row_idx].buttons) > 0:
+                if 0 <= row_idx < len(msg.reply_markup.rows) and len(msg.reply_markup.rows[row_idx].buttons) > 0:
                     button = msg.reply_markup.rows[row_idx].buttons[0]
 
-            if button and hasattr(button, 'data'):
+            data = callback_data(button)
+            if data is None:
+                return [types.TextContent(type="text", text=json.dumps({"error": "Select an explicit callback button; URL and other button types are unsupported", "available_buttons": buttons_info}))]
+            if data is not None:
                 try:
                     result = await client(GetBotCallbackAnswerRequest(
                         peer=entity,
                         msg_id=message_id,
-                        data=button.data if button.data else b''
+                        data=data
                     ))
                     callback_msg = result.message
                     callback_alert = result.alert
                     used_low_level = True
                 except Exception as e:
-                    # Low-level API failed, will fall back to msg.click()
-                    callback_msg = None
-                    callback_alert = None
-                    used_low_level = False
-
-            # --- Fallback: Use Telethon's built-in msg.click() ---
-            if not used_low_level:
-                callback_answer_obj = None
-                try:
-                    if button_text:
-                        callback_answer_obj = await msg.click(text=button_text)
-                    elif row_idx is not None and col_idx is not None:
-                        callback_answer_obj = await msg.click(row=row_idx, col=col_idx)
-                    elif row_idx is not None:
-                        callback_answer_obj = await msg.click(row=row_idx, col=0)
-                    else:
-                        # Default: click first button
-                        callback_answer_obj = await msg.click(0)
-                except Exception as e:
-                    return [types.TextContent(type="text", text=json.dumps({"error": f"Click failed: {str(e)}", "available_buttons": buttons_info}))]
-
-                # Extract callback answer from msg.click() return value
-                if callback_answer_obj:
-                    callback_msg = getattr(callback_answer_obj, 'message', None) or str(callback_answer_obj)
-                    callback_alert = getattr(callback_answer_obj, 'alert', None)
+                    # The callback may have taken effect; never retry an uncertain write.
+                    return [types.TextContent(type="text", text=json.dumps({"error": safe_error(e), "outcome": "unknown; inspect before retrying"}))]
 
             # Small delay to let the bot respond (edit message, send new message, etc.)
             await asyncio.sleep(2.5)
@@ -969,54 +979,20 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
 
             return [types.TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
 
-        elif name == "request_web_app":
-            bot_target = arguments["bot"]
-            short_name = arguments.get("short_name", "app")
-            platform = arguments.get("platform", "android")
-            
-            names_to_try = [short_name] if short_name != "app" else ["app", "webapp", "main", "web", "dordor", "bot", "index"]
-            
-            bot_entity = await _resolve(client, bot_target)
-            input_user = InputUser(user_id=bot_entity.id, access_hash=bot_entity.access_hash)
-            results = []
-            found_url = None
-            
-            for name in names_to_try:
-                try:
-                    result = await client(RequestAppWebViewRequest(
-                        peer=bot_entity,
-                        app=InputBotAppShortName(bot_id=input_user, short_name=name),
-                        platform=platform,
-                        write_allowed=True
-                    ))
-                    results.append({"short_name": name, "url": result.url})
-                    found_url = result.url
-                    break
-                except Exception as e:
-                    err = str(e)
-                    if "BOT_APP_INVALID" in err or "APP_SHORTNAME" in err or "not found" in err.lower():
-                        results.append({"short_name": name, "error": "not_found"})
-                    else:
-                        results.append({"short_name": name, "error": f"{type(e).__name__}: {err[:200]}"})
-            
-            return [types.TextContent(type="text", text=json.dumps({
-                "bot": bot_target,
-                "bot_id": bot_entity.id,
-                "has_main_app": getattr(bot_entity, 'bot_has_main_app', None),
-                "found_url": found_url,
-                "tried": results,
-                "platform": platform
-            }, ensure_ascii=False, indent=2))]
-
         else:
             return [types.TextContent(type="text", text=json.dumps({"error": f"Unknown tool: {name}"}))]
 
     except Exception as e:
-        return [types.TextContent(type="text", text=json.dumps({"error": str(e)}, ensure_ascii=False))]
+        return [types.TextContent(type="text", text=json.dumps({"error": safe_error(e)}, ensure_ascii=False))]
 
 async def main():
-    async with stdio_server() as (read_stream, write_stream):
-        await server.run(read_stream, write_stream, server.create_initialization_options())
+    try:
+        async with stdio_server() as (read_stream, write_stream):
+            await server.run(read_stream, write_stream, server.create_initialization_options())
+    finally:
+        await accounts.close()
 
 if __name__ == "__main__":
+    if os.name == "posix":
+        os.umask(0o077)
     asyncio.run(main())

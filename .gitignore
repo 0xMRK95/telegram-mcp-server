@@ -35,3 +35,11 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+# SQLite sidecars and private multi-account configuration
+*.session-wal
+*.session-shm
+*.mcp-lock
+accounts.json
+accounts.*.json
+.accounts-*
+*_output/

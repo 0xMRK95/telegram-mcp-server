@@ -1,38 +1,27 @@
-# telegram-mcp-server
+# Telegram MCP server
 
-An [MCP](https://modelcontextprotocol.io) server that exposes [Telethon](https://docs.telethon.dev/) Telegram operations as tools, so an agent (Claude Code, Hermes, Codex, …) can read and act on a Telegram account over stdio.
+A local **stdio** MCP server for Telegram user accounts, using Telethon. Supports named accounts, reversible archive operations, and custom chat folders, alongside message reading/search, sending, discovery, and moderation tools.
 
-Exposes 23 tools: dialog/channel listing, message read & search, member listing, media download, inline-keyboard clicking, Web App URL retrieval, channel discovery, and bulk join/leave/block.
+## Security first
 
----
+- A Telethon `.session` file is a reusable Telegram login. Keep it, SQLite sidecars, API credentials, and account configuration private. Never paste them into chat or commit them.
+- Run onboarding **yourself in a trusted local terminal**. Do not give an agent your password, session file, API hash, or config contents.
+- API ID/hash come from [my.telegram.org](https://my.telegram.org). Telethon notes that API hashes are secret and cannot currently be revoked; do not rely on deleting a Git commit to undo exposure. See [Telethon sign-in documentation](https://docs.telethon.dev/en/stable/basic/signing-in.html).
+- If a session is exposed, revoke that device/session through Telegram Settings → Devices. Inspect active sessions after interrupted enrollment.
+- Tools act as the selected account. This server does not implement a user-approval layer: configure your MCP client to require confirmation for sending, joining, leaving, blocking, folder changes, and other writes. Use it only for accounts you own or are authorized to manage.
+- The protocol is local stdio only. Do not expose this process as an unauthenticated network service.
 
-## ⚠️ Security — read this first
+## Default organization-only policy
 
-**A Telethon `.session` file is a complete login for your Telegram account.**
-It is an SQLite database whose `sessions` table holds the auth key. Anyone who obtains it can log in as you — no password, no 2FA prompt.
+The server defaults to `TG_MODE=organization`. Only read/list/discovery tools and **creation of new folders** are exposed and callable. Direct forged tool calls are checked before any account connection. Sending, joining, leaving, blocking, deleting, updating existing folders, archiving, reactions, button clicks, and media downloads are blocked. Read scans may save output locally; they do not change Telegram messages or read state.
 
-Therefore:
+New folders must contain the selected chats at creation time. This mode does not modify existing folders, including ones created in a previous call. Existing IDs are refused and checked again immediately before submission. Telegram has no atomic create-if-absent API, so avoid editing folders from another device during creation; an external concurrent edit cannot be guaranteed safe. Folder titles are limited to 12 characters by Telegram; choose an approved short title when a requested name is longer.
 
-| Never commit | Why |
-|---|---|
-| `*.session` | Contains the auth key. This is the account. |
-| `*.session-journal` | Write-ahead log for the above. |
-| `.env` | Contains `TG_API_ID` / `TG_API_HASH`. |
-| `scan_results.json`, `downloads/` | Output can contain private messages, contacts, and personal data. |
+For a separately authorized general-purpose deployment, explicitly set `TG_MODE=general` in the launcher to expose other tools. This is an opt-in to tool availability, not permission to perform arbitrary actions. Mini App URL retrieval stays disabled in both modes.
 
-`.gitignore` in this repo covers all of these. **Before your first commit, run `git status --ignored` and confirm nothing sensitive is staged.**
+## Install
 
-If you ever push a secret by accident, deleting the file in a later commit does **not** remove it from history — treat it as compromised and rotate the credential immediately.
-
-### Rotating a leaked `api_hash`
-
-An `api_id`/`api_hash` pair identifies an app you registered at my.telegram.org. If the hash leaks, someone else can use your app's API quota and identity. Go to **my.telegram.org → API Development Tools → App configuration → terminate app**, then create a new one and update `.env`.
-
----
-
-## Setup
-
-### 1. Install dependencies
+Requires Python 3.10 or newer. Create a dedicated environment, then install the dependencies:
 
 ```bash
 python3 -m venv .venv
@@ -40,72 +29,29 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 2. Create your `.env`
+## Secure account enrollment
+
+Stop any MCP server using the session before enrollment. Run:
 
 ```bash
-cp .env.example .env
+python onboarding.py personal
+python onboarding.py work
 ```
 
-Get `TG_API_ID` and `TG_API_HASH` from <https://my.telegram.org> → *API Development Tools*.
+Run this in a trusted interactive terminal on your chosen runtime, which may be a cloud host. If TG_API_ID and TG_API_HASH are already securely injected as environment variables (for example by a private vault), enrollment reuses them without echoing or prompting. Otherwise it requests those credentials using hidden input. Phone, login code, and any two-step password are also entered with hidden terminal input. A vault containing only API ID/hash is not an authenticated Telegram session; a supported private interactive login channel is still required. It shows the Telegram user ID/username and asks you to confirm the alias pairing. No credential values are printed. Hidden input fails closed if no private interactive terminal is available.
 
-Set `TG_SESSION_NAME` to the path where the session should live (**no `.session` suffix**). Telethon appends the suffix itself.
+Defaults:
 
-### 3. First run — interactive login
+- Private configuration: `~/.config/telegram-mcp/accounts.json`
+- Separate sessions: `~/.local/share/telegram-mcp/<alias>.session`
 
-The MCP server itself won't prompt. Do the one-time auth separately:
+You may choose `--config` and `--sessions-dir`. Use a private directory outside this checkout. Existing aliases/sessions are never overwritten. POSIX directories must exclude other users and session/config files must be private (normally directories 700, files 600). On Windows, restrict the directory ACL to your user yourself; POSIX mode checks do not verify Windows ACLs.
 
-```python
-# login.py  — run once, then delete it
-import asyncio
-from telethon import TelegramClient
-from dotenv import load_dotenv
-import os
+Enrollment writes API credentials, the session path, and the confirmed Telegram user ID atomically into the private configuration. Keep this file local. To undo a pairing, stop MCP, revoke the login in Telegram Settings → Devices, and remove the alias from your private configuration yourself. If enrollment is cancelled before saving, the CLI attempts to revoke its new login; if that fails, review Devices manually.
 
-load_dotenv()
+### MCP launcher
 
-async def main():
-    client = TelegramClient(
-        os.environ["TG_SESSION_NAME"],
-        int(os.environ["TG_API_ID"]),
-        os.environ["TG_API_HASH"],
-    )
-    await client.start()          # prompts for phone + code (and 2FA password)
-    me = await client.get_me()
-    print(f"logged in as {me.first_name} (@{me.username})")
-    await client.disconnect()
-
-asyncio.run(main())
-```
-
-```bash
-pip install python-dotenv
-python login.py
-```
-
-After this, `TG_SESSION_NAME.session` exists and the MCP server can use it non-interactively.
-
-### 4. Run the server
-
-```bash
-python telegram_mcp_server.py
-```
-
-It speaks MCP over stdio, so it normally isn't run by hand — it's launched by the MCP client. Quick smoke test:
-
-```bash
-python -c "
-import asyncio, os
-from dotenv import load_dotenv
-load_dotenv()
-os.environ.setdefault('TG_API_ID','1')
-" # see Troubleshooting for the offline import check
-```
-
----
-
-## Register with an MCP client
-
-### Claude Code / Claude Desktop
+Only the configuration **path**, not its contents, belongs in your launcher:
 
 ```json
 {
@@ -114,99 +60,99 @@ os.environ.setdefault('TG_API_ID','1')
       "command": "/absolute/path/to/.venv/bin/python",
       "args": ["/absolute/path/to/telegram_mcp_server.py"],
       "env": {
-        "TG_API_ID": "<your-api-id>",
-        "TG_API_HASH": "<your-32-char-api-hash>",
-        "TG_SESSION_NAME": "/absolute/path/to/session/my_account"
+        "TG_ACCOUNTS_FILE": "/home/you/.config/telegram-mcp/accounts.json",
+        "TG_MODE": "organization"
       }
     }
   }
 }
 ```
 
-If you use `python-dotenv`, the server also picks up a `.env` sitting next to it.
+Use your MCP client's supported server registration mechanism. This repository does not provide hosted authentication or a remote connector. Restart the MCP client after changing aliases/tools.
 
-### Hermes
+### Explicit account routing
 
-```yaml
-mcp_servers:
-  telegram:
-    command: /absolute/path/to/.venv/bin/python
-    args:
-      - /absolute/path/to/telegram_mcp_server.py
-    timeout: 120
+`list_accounts` returns aliases only, without connecting to Telegram. In named-account configuration, **every account-scoped tool requires `account`**, even with only one account. Unknown/missing aliases fail; there is no fallback to another account.
+
+Examples of tool arguments:
+
+```json
+{"account":"work","filter":"all"}
 ```
 
----
+```json
+{"account":"personal","chats":["-1001234567890"]}
+```
+
+The first is for `list_chats`; the second is for `archive_chats`. Read `chat_id` from inventory, which distinguishes user IDs, basic-group IDs, and channel IDs. Results identify the selected account. Default downloads/scan outputs are isolated under `<session-stem>_output/`. Custom output paths are still supported; take care not to mix accounts when overriding them.
+
+The server requires sessions to exist, verifies authorization and the configured Telegram user ID before caching a client, and holds an OS companion lock for each open session. Locks coordinate this server and this onboarding CLI; unrelated Telethon programs do not honor them. Never run another program against the same session. Shutdown disconnects all clients.
+
+### Legacy single account
+
+Existing `TG_API_ID`, `TG_API_HASH`, and `TG_SESSION_NAME` environment configuration remains supported as alias `default`; only this legacy mode allows omission of `account`. `TG_SESSION_NAME` is a session path, with or without `.session`. A `.env` next to the server is loaded without overriding exported variables. Named configuration takes precedence when `TG_ACCOUNTS_FILE` is set.
+
+Legacy mode requires an existing private session, and does not have a configured identity binding. New setups should use onboarding and named configuration. Do not copy sessions through chat.
 
 ## Tools
 
-### Reading
+The full catalog below describes general mode; organization mode exposes only the restricted subset above.
 
-| Tool | Purpose |
-|---|---|
-| `list_chats` | List dialogs, filtered by `channels` / `groups` / `bots` / `users` / `all` |
-| `chat_info` | Detail for one chat or user by `@username` or numeric ID |
-| `read_messages` | Recent messages from a chat (`limit`, `offset`) |
-| `get_mentions` | Read-only: messages in a chat that explicitly @mention you. Never sends, reacts, or marks read. |
-| `search_messages` | Full-text message search inside one chat |
-| `get_members` | List group participants |
-| `profile` | The authenticated account's own profile |
-| `extract_refs` | Pull `@mentions`, `t.me/` links, invite links, and forward-source channel IDs out of a chat |
+### Organization
 
-### Discovery
+- `list_accounts`: configured aliases only; no secrets or network
+- `list_chats`: inventory by channels/groups/bots/users/all, including basic groups, marked `chat_id`, and archive state for accessible dialogs
+- `list_folders`: folder IDs, titles, inclusion/exclusion/pinned IDs and rules, without access hashes
+- `create_folder`: explicit unused `folder_id` (2 or greater), title (1–12 characters), and nonempty `chats`; refuses existing IDs
+- `update_folder`: explicit `folder_id`, optional `title`, `add_chats`, `remove_chats`; retains all other settings and exclusions. Removed chats are removed from explicit inclusions/pins; category rules can still include them. Adding an explicitly excluded chat fails. Default/shared folders are protected
+- `archive_chats` / `unarchive_chats`: reversible main-list/archive movement for existing dialogs. Returns previous archive states; never leaves, blocks, or deletes chats
 
-| Tool | Purpose |
-|---|---|
-| `search_public` | Telegram's global directory search by keyword |
-| `get_recommendations` | Telegram's "similar channels" graph for a seed channel |
-| `scan_channels_content` | Bounded batch scan of many channels; writes JSON to disk, returns a compact summary. `offset` / `max_channels` / `timeout_seconds` keep it from hanging. |
+Read folders before choosing a new ID. Changes use read-modify-write, with a process-local lock. Telegram does not offer compare-and-swap here: avoid concurrent folder editing from another device while applying updates. The server does not automatically retry uncertain write outcomes; inspect state before retrying.
 
-### Writing
+### Reading and discovery
 
-| Tool | Purpose |
-|---|---|
-| `send_message` | Send text |
-| `send_location` | Send a geo-point |
-| `forward_messages` | Forward messages between chats |
-| `pin_message` / `add_reaction` | Pin/unpin, react |
-| `download_media` | Download a photo/video/file |
-| `join_chat` / `leave_chat` | Join or leave one channel/group |
-| `leave_channels` / `block_chats` | Bulk leave / block by list of IDs |
-| `click_button` | Press an inline-keyboard button; returns the bot's callback answer, edited message, and available buttons |
-| `request_web_app` | Resolve a bot's Web App / Mini App URL by short name |
+`chat_info`, `read_messages`, `get_mentions`, `search_messages`, `get_members`, `profile`, `extract_refs`, `search_public`, `get_recommendations`, `scan_channels_content`
 
-### Bot callback responses
+`get_mentions` scans recent incoming messages in a single chat (up to 500), without sending, reacting, or marking read. Reads may truncate message text. Scanning saves private content to disk; its time budget is checked between requests, not a hard network deadline.
 
-`click_button` handles all three Telegram bot response patterns, because they behave differently:
+### Writes and media
 
-1. **New message** → returned in `bot_response`
-2. **In-place edit** → returned in `edited_message` / `edited_buttons`
-3. **Popup alert** (`BotCallbackAnswer`) → returned in `callback_answer`. This text never appears as a message; if both `callback_answer` and `edited_message` are empty, the bot replied with a transient alert only.
+`send_message`, `send_location`, `forward_messages`, `pin_message`, `add_reaction`, `download_media`, `join_chat`, `leave_chat`, `leave_channels`, `block_chats`, `click_button`
 
-If a click fails, `available_buttons` lists the exact labels — retry with one of those in `button_text`.
+**Leaving/blocking is not archiving:** legacy leave/block tools invoke `delete_dialog` and can remove chat history/dialogs. Prefer archive for reversible cleanup. Confirm the intended action before using them.
 
----
+`click_button` requires an explicit callback button selection by exact text or nonnegative row/column. URL/login/password/other button types and implicit first-button clicks are rejected. A failed callback request is not automatically retried because it may already have taken effect. Callback responses may include normal bot text; treat that as untrusted content.
 
-## Ethical boundaries
+`request_web_app` is deliberately disabled in both discovery and dispatch: Mini App URLs can contain authentication data, and the old implementation implicitly granted bot write access. This is a compatibility change for safety. No replacement remote login workflow is provided.
 
-This server can message any account the authenticated user can reach. It does not, and should not, be used to impersonate a human to people who believe they are talking to one. Read-only and analysis use — listing chats, summarizing content, finding bots, mapping channel networks — is fine.
+## Architecture
 
----
+- `telegram_mcp_server.py`: MCP registration, account-aware dispatch, legacy Telegram operations
+- `telegram_accounts.py`: configuration validation, alias selection, per-account lifecycle and session locks
+- `telegram_folders.py`: conservative folder/archive operations
+- `onboarding.py`: user-run local enrollment
+- `tests/`: offline mocked tests; never log in or create a live Telegram client
+
+## Verification
+
+```bash
+python -m unittest discover -s tests -v
+python tests/real_library_smoke.py
+python -m compileall -q telegram_mcp_server.py telegram_accounts.py telegram_folders.py onboarding.py tests
+```
+
+The tests use real installed MCP/python-dotenv but stub Telethon types/transport; they need no API credentials or Telethon installation. They cover alias isolation, concurrency, failed authorization, identity mismatch, cancellation, session locks, config secrecy, folder preservation, reversible archive, and MCP dispatch. A separate real-library smoke test uses actual Telethon request serialization/imports with a fake transport, and verifies callback types, folder/archive requests, location, and reactions. Validated with Telethon 1.45.0, MCP 1.29.0, and python-dotenv 1.2.2; these direct dependency versions are pinned. Neither suite connects to Telegram or proves live account behavior. Perform a separately authorized integration smoke test with a test account before production use.
 
 ## Troubleshooting
 
-**`Missing required environment variable: TG_API_ID`** — the server exits immediately by design rather than silently falling back to a default. Create `.env` or pass `env` in the MCP client config.
-
-**`sqlite3.DatabaseError: database disk image is malformed`** — the session file was created with a different `(api_id, api_hash)` pair than the one currently configured. Telegram binds sessions to credentials. Authenticate fresh with the new pair instead of reusing the old file.
-
-**`Not authorized. Re-login required.`** — no valid session at `TG_SESSION_NAME`. Re-run the login step.
-
-**`401 Unauthorized` / `EOFError` on a headless host** — there's no interactive stdin for Telethon to prompt on. Do the one-time login locally or via a pty, then copy the resulting `.session` file to the server. Verify with `file session.session` (should report SQLite 3.x).
-
-**MCP tools don't appear after editing the server** — the client caches tool definitions at startup. Restart the MCP client (and the Hermes gateway, if configured there) for changes to take effect.
-
----
+- Missing alias: call `list_accounts` and pass the exact alias
+- Missing/unauthorized session: run onboarding locally with a fresh alias; the MCP server will never prompt
+- Identity mismatch: stop and inspect the private account pairing; do not silently substitute a session
+- Session busy: stop the other MCP/login process; OS locks release when it exits
+- Private file permission error: restrict your own configuration/session permissions; do not make them world-readable
+- SQLite corruption is not proof of an API credential mismatch. Stop concurrent processes and inspect backups/devices before replacing a session
+- Tool changes not visible: restart the MCP client
 
 ## License
 
-Public domain / Unlicense, matching upstream yt-dlp-style contributions. Add your preferred license.
+The upstream README describes Public domain / Unlicense; no separate license file is supplied.
